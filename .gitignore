@@ -1,0 +1,29 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data: datasets are never committed (see data/README.md)
+/data/*
+!/data/README.md
+
+# runs, models and reports
+/runs/
+/models/
+/reports/
+*.joblib
+*.pkl
+*.db
+/.cache/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
