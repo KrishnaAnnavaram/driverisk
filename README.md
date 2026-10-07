@@ -34,6 +34,10 @@
 > vocabulary are in [`docs/ste-style-guide.md`](docs/ste-style-guide.md). Each term in the
 > [Glossary](#15-glossary) has only one meaning.
 
+> [!CAUTION]
+> Do not use the driverisk risk index as a pricing, underwriting or claims decision. A person must review it.
+> Telematics traces are personal location data. Get the consent of each driver, and keep the files private.
+
 ---
 
 driverisk changes a raw telematics stream into one row for each trip, with exposure, features and a target.
@@ -471,8 +475,7 @@ Planned milestones (not built): map matching of the GPS track, claims as a secon
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **31 passed** | `pytest -q` |
-| Expected CI | 31 passed in a clean venv with `.[dev]` only (pandas 3.0, scikit-learn 1.9) | `.github/workflows/ci.yml` |
+| Unit tests (CI installs only `.[dev]`) | **31 passed** (pandas 3.0, scikit-learn 1.9) | `pytest -q` |
 | Synthetic ingest | 1,402,560 readings, 40 devices, 0 bad values, 480 trips | `driverisk train` |
 | Synthetic grouped CV (30 training devices, 5 folds) | Poisson deviance: baseline 1.796, glm 1.617, hgb 1.651. D²: glm 0.094, hgb 0.015 | `driverisk train` |
 | Synthetic held-out devices (10 devices, 120 trips, glm) | D² 0.076, normalised Gini 0.522, expected / observed 0.997, driver Spearman 0.879 | `driverisk train` |
