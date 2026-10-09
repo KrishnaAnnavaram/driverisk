@@ -73,6 +73,7 @@ This README is the **one location that explains all of driverisk**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one trip](#42-the-life-cycle-of-one-trip)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The ingest and the trips](#5-the-ingest-and-the-trips)
 6. 🟢 [The context providers](#6-the-context-providers)
 7. 🟣 [The trip table and the rate models](#7-the-trip-table-and-the-rate-models)
@@ -141,6 +142,52 @@ flowchart LR
 | Model card | `src/driverisk/report.py` | `model_card.md` from the run summary |
 | CLI | `src/driverisk/cli.py` | The `driverisk` command with 6 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>driverisk command"]
+    CFG["config.py<br/>Settings, load_env_file"]
+    SYN["synthetic.py<br/>simulate_fleet"]
+    subgraph STREAM["Stream to trip table"]
+        PIPE["pipeline.py<br/>make_providers, build_trips"]
+        ING["ingest.py<br/>pivot_wide, IngestReport"]
+        TRP["trips.py<br/>segment_trips, add_kinematics"]
+        FEA["features.py<br/>build_trip_table, assert_no_label_inputs"]
+        EVT["events.py<br/>EventRules, trip_events"]
+    end
+    subgraph CTX["context/"]
+        WX["weather.py<br/>Offline, Csv, OpenMeteo, attach_weather"]
+        RD["roads.py<br/>OfflineRoads, RoadSegmentsCsv, attach_roads"]
+        COL["collisions.py<br/>CollisionPrior"]
+    end
+    subgraph LEARN["Models and runs"]
+        EXP["experiment.py<br/>train, grouped_cv, score_drivers"]
+        MOD["models.py<br/>RateModel"]
+        EVA["evaluate.py<br/>rate_metrics, driver_table"]
+        REP["report.py<br/>model_card"]
+    end
+
+    CLI --> CFG
+    CLI --> ING
+    CLI --> SYN
+    CLI --> PIPE
+    CLI --> EXP
+    CLI --> REP
+    PIPE --> ING
+    PIPE --> TRP
+    PIPE --> WX
+    PIPE --> RD
+    PIPE --> COL
+    PIPE --> FEA
+    FEA --> EVT
+    EXP --> MOD
+    EXP --> EVA
+    EXP --> FEA
+    SYN --> WX
+    SYN --> RD
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -184,6 +231,20 @@ driverisk/
 ### 3.2 The target is independent of the features
 The target counts harsh events in the acceleration signals. `assert_no_label_inputs` refuses a feature name that contains `acc_x`, `acc_y`, `acc_z`, `acc_long` or `harsh_`. A test doubles the acceleration and shows that the features stay the same.
 
+```mermaid
+flowchart LR
+    subgraph READ["One trip of readings"]
+        ACC[/"acc_long, acc_y"/]
+        OTH[/"speed, rpm, time, position,<br/>weather, road class, collisions"/]
+    end
+    ACC --> EV["trip_events: EventRules"]
+    EV --> TGT[/"Target: harsh_events"/]
+    OTH --> FT["_trip_row: 22 FEATURES"]
+    FT --> CHK{"assert_no_label_inputs:<br/>a name with acc_x, acc_y, acc_z,<br/>acc_long or harsh_?"}
+    CHK -- "yes" --> ERR[/"LabelInFeatures"/]
+    CHK -- "no" --> X[/"Model inputs"/]
+```
+
 ### 3.3 Context matches place and hour
 `attach_weather` joins on the weather cell and the UTC hour. A reading with no position gets no weather. A station CSV gives weather only within 50 km.
 
@@ -217,24 +278,67 @@ Each model learns events per km with the trip distance as the weight. The expect
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    CSV["Long CSV or simulated fleet"] --> ING["pivot_wide: one row for each device and second"]
-    ING --> SEG["segment_trips: ignition and 10-minute gaps"]
-    SEG --> KIN["add_kinematics: distance, acc_long"]
+flowchart TD
+    SRC{"--data or DRIVERISK_DATA?"} -- "yes" --> CSV[/"Long telematics CSV<br/>deviceId, timestamp, variable, value"/]
+    SRC -- "no" --> SIM["simulate_fleet: 40 drivers, 12 trips"]
+    CSV --> ING["pivot_wide: one row for each device and second"]
+    SIM --> ING
+    ING --> SEG["segment_trips: ignition and gaps over 600 s"]
+    SEG --> KIN["add_kinematics: dt_s, dist_m, acc_long"]
     KIN --> WX["attach_weather: cell and hour"]
+    WXS[("Weather provider<br/>offline, station CSV or Open-Meteo cache")] --> WX
     WX --> RD["attach_roads: class and speed limit"]
-    RD --> COL{"collision prior coverage >= 50 %?"}
+    RDS[("Road provider<br/>offline or OSM point CSV")] --> RD
+    RD --> COL{"Collision prior set<br/>and coverage ≥ 50 %?"}
+    COLS[("Collision table CSV<br/>optional")] --> COL
     COL -- "yes" --> DEN["collision_density"]
     COL -- "no or none" --> TT
     DEN --> TT["build_trip_table: features, distance_km, harsh_events"]
+    TT0[/"--trip-table CSV"/] -- "skips the ingest" --> TT
     TT --> HO["holdout_split: 25 % of devices"]
     HO --> CV["GroupKFold CV: baseline, glm, hgb"]
-    CV --> FIT["fit the lowest-deviance model on training devices"]
-    FIT --> TEST["score held-out devices once"]
-    TEST --> CARD["model card, metrics.json, model.joblib"]
+    CV --> FIT["Fit the lowest-deviance model<br/>on the training devices"]
+    FIT --> TEST["Score the held-out devices once"]
+    TEST --> RUN[("runs/name<br/>model.joblib, metrics.json, model_card.md")]
+    RUN --> SCORE["score: risk index for each driver"]
+    SCORE --> HUMAN{{"HUMAN REVIEW<br/>a person reviews the index,<br/>no automatic pricing or claims decision"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one trip
+
+```mermaid
+stateDiagram-v2
+    state "Long readings" as Long
+    state "Wide rows, one per second" as Wide
+    state "Dropped, ignition off" as Off
+    state "Trip with trip_id" as Trip
+    state "Trip with kinematics" as Kin
+    state "Trip with context" as Ctx
+    state "Trip table row" as Row
+    state "Dropped, too short" as Short
+    state "Training trip" as Train
+    state "Held-out trip" as Test
+    state "Scored in the driver table" as Scored
+    [*] --> Long: device sends one row for each signal
+    Long --> Wide: pivot_wide
+    Wide --> Off: ignition 0
+    Wide --> Trip: segment_trips, ignition 0 to 1 or gap over 600 s
+    Trip --> Kin: add_kinematics
+    Kin --> Ctx: attach_weather, attach_roads, collision density
+    Ctx --> Row: build_trip_table
+    Ctx --> Short: fewer than 2 rows
+    Row --> Short: under 0.5 km or 2 minutes
+    Row --> Train: device in the 75 % part
+    Row --> Test: device in the 25 % held-out part
+    Train --> Scored: score uses all trips
+    Test --> Scored: rate x distance_km
+    Off --> [*]
+    Short --> [*]
+    Scored --> [*]
+```
 
 1. The device sends readings, one row for each signal.
 2. The ingest makes one typed row for each device and second.
@@ -245,11 +349,96 @@ flowchart TB
 7. Trips shorter than 0.5 km or 2 minutes are dropped.
 8. The model gives the trip a rate. The driver table adds the trips of each device.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Analyst
+    participant CLI as driverisk CLI
+    participant CFG as Settings
+    participant PIPE as pipeline.py
+    participant CTX as Context providers
+    participant OM as Open-Meteo API
+    participant EXP as experiment.py
+    participant FS as runs/ folder
+
+    A->>CLI: driverisk train --out runs/fleet
+    CLI->>CFG: load_env_file, Settings.from_env, check
+    CLI->>CLI: read_long_csv, or simulate_fleet
+    CLI->>PIPE: make_providers(settings)
+    CLI->>PIPE: build_trips(long_df, weather, roads, collisions)
+    PIPE->>PIPE: pivot_wide, segment_trips, add_kinematics
+    PIPE->>CTX: attach_weather, one call for each cell
+    opt DRIVERISK_WEATHER is open-meteo and no cache file
+        CTX->>OM: GET archive, cell and day range
+        OM-->>CTX: hourly temperature, precipitation, wind
+    end
+    PIPE->>CTX: attach_roads, collision coverage
+    PIPE->>PIPE: build_trip_table
+    PIPE-->>CLI: trip table, ingest report, context report
+    CLI->>EXP: train(table, models, seed, folds)
+    EXP->>EXP: holdout_split, grouped_cv for each model
+    EXP->>EXP: fit the chosen model, rate_metrics on held-out devices
+    EXP-->>CLI: summary and bundle
+    CLI->>FS: save_run: model.joblib, metrics.json, model_card.md
+    CLI-->>A: CV table, chosen model, held-out metrics
+    A->>CLI: driverisk score --run runs/fleet --out drivers.csv
+    CLI->>FS: load_run
+    CLI->>EXP: score_drivers(bundle, table)
+    EXP-->>CLI: driver table with risk_index
+    CLI-->>A: drivers.csv
+```
+
 ---
 
 ## 5. The ingest and the trips
 
 **Purpose.** Change the raw stream into typed readings and trips.
+
+```mermaid
+flowchart TD
+    IN[/"Long CSV read as text"/] --> REQ{"deviceId, timestamp,<br/>variable, value present?"}
+    REQ -- "no" --> E1[/"TelematicsError: missing columns"/]
+    REQ -- "yes" --> SIG["normalise_variable, map with SIGNALS"]
+    SIG --> UNK["Count unknown variables, drop them"]
+    UNK --> TS["Timestamps to UTC, floor to the second,<br/>count and drop bad timestamps"]
+    TS --> EMP{"Rows left?"}
+    EMP -- "no" --> E2[/"TelematicsError: no usable rows"/]
+    EMP -- "yes" --> NUM["Numeric signals: to_numeric,<br/>count bad numbers"]
+    EMP -- "yes" --> IGN["ignition: parse_ignition"]
+    EMP -- "yes" --> POS["POSITION: parse_position,<br/>count bad positions"]
+    NUM --> PIV["Pivot: one row for each device and second"]
+    IGN --> PIV
+    POS --> PIV
+    PIV --> UNIT{"DRIVERISK_ACC_UNIT = g?"}
+    UNIT -- "yes" --> MUL["acc_x, acc_y, acc_z × 9.80665"]
+    UNIT -- "no" --> FILL
+    MUL --> FILL["Each device: position kept for 5 s,<br/>ignition kept to the next change"]
+    FILL --> OUT[/"Wide rows and IngestReport"/]
+```
+
+The trip steps on the wide rows:
+
+```mermaid
+flowchart TD
+    W[/"Wide rows of one device,<br/>sorted by time"/] --> NEW{"First row, gap over 600 s,<br/>or ignition 0 to 1?"}
+    NEW -- "yes" --> START["Start a new trip number"]
+    NEW -- "no" --> SAME["Same trip"]
+    START --> OFF{"Ignition 0?"}
+    SAME --> OFF
+    OFF -- "yes" --> DROP["Drop the row"]
+    OFF -- "no or unknown" --> ID["trip_id = device-NNNN"]
+    ID --> AX{"acc_x present?"}
+    AX -- "yes" --> AL1["acc_long = acc_x"]
+    AX -- "no" --> AL2["acc_long = speed change / dt,<br/>only where dt is 3 s or less"]
+    AL1 --> GPS{"Both positions known<br/>and dt 60 s or less?"}
+    AL2 --> GPS
+    GPS -- "yes" --> D1["dist_m = haversine"]
+    GPS -- "no" --> D2["dist_m = mean speed × dt,<br/>0 when dt is over 60 s"]
+    D1 --> OUT[/"Readings with trip_id,<br/>dt_s, dist_m, acc_long"/]
+    D2 --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -268,11 +457,90 @@ flowchart TB
 9. Use `acc_x` as `acc_long`. If `acc_x` is missing, use the speed change, only where two readings are at most 3 s apart.
 10. Use the GPS distance. If a position is missing, use the mean speed times the time step.
 
+With no CSV, `simulate_fleet` makes the same long format:
+
+```mermaid
+flowchart LR
+    P[/"drivers, trips, seed"/] --> DRV["Each device DEVnnn:<br/>hidden style, start place"]
+    DRV --> TRIP["Each trip: 4 to 16 minutes"]
+    TRIP --> CTX["OfflineWeather and OfflineRoads:<br/>rain, night, speed limit"]
+    CTX --> STEP["Each second: target speed from the limit<br/>and the style, harsh events by chance"]
+    STEP --> WIDE["Speed, acceleration X and Y,<br/>RPM, POSITION"]
+    WIDE --> MELT["Melt to long rows, add<br/>IGNITION_STATUS 1 and 0"]
+    MELT --> OUT[/"deviceId, timestamp, variable, value"/]
+```
+
 ---
 
 ## 6. The context providers
 
 **Purpose.** Add weather, road class and collision density for the place and the hour of each reading.
+
+```mermaid
+flowchart TD
+    S[/"Settings"/] --> W{"DRIVERISK_WEATHER"}
+    W -- "offline" --> OW["OfflineWeather(seed)"]
+    W -- "csv" --> CW["CsvWeather(DRIVERISK_WEATHER_CSV)"]
+    W -- "open-meteo" --> MW["OpenMeteoWeather(cache_dir, user_agent)"]
+    S --> R{"DRIVERISK_ROADS"}
+    R -- "offline" --> OR["OfflineRoads(seed)"]
+    R -- "csv" --> CR["RoadSegmentsCsv(DRIVERISK_ROADS_CSV)"]
+    S --> C{"DRIVERISK_COLLISIONS_CSV set?"}
+    C -- "yes" --> CP["CollisionPrior.from_csv"]
+    C -- "no" --> NP["No prior"]
+    OW --> OUT[/"weather, roads, collisions"/]
+    CW --> OUT
+    MW --> OUT
+    OR --> OUT
+    CR --> OUT
+    CP --> OUT
+    NP --> OUT
+```
+
+`attach_weather` joins the weather on the cell and the hour:
+
+```mermaid
+flowchart TD
+    P[/"Readings with time and position"/] --> HP{"Position known?"}
+    HP -- "no" --> NAN["Weather columns stay NaN"]
+    HP -- "yes" --> CELL["Cell = round of lat and lon / 0.1,<br/>hour = time floored to the hour"]
+    CELL --> GRP["Group by cell"]
+    GRP --> ASK["provider.hourly once for each cell:<br/>first day 00:00 to last day 23:00"]
+    ASK --> PR{"Provider"}
+    PR -- "offline" --> OFF["Seeded hours for each<br/>seed, cell and day"]
+    PR -- "csv" --> ST{"Nearest station<br/>within 50 km?"}
+    ST -- "yes" --> OBS["Station hours"]
+    ST -- "no" --> NAN
+    PR -- "open-meteo" --> CA{"Cache file?"}
+    CA -- "yes" --> JS["JSON from the cache"]
+    CA -- "no" --> GET["GET archive API, write the cache"]
+    GET --> JS
+    OFF --> JOIN["Left join on cell and hour"]
+    OBS --> JOIN
+    JS --> JOIN
+    JOIN --> OUT[/"temp_c, precip_mm, wind_ms<br/>for each reading"/]
+```
+
+Road class and collision density for each reading:
+
+```mermaid
+flowchart TD
+    P[/"Readings with lat and lon"/] --> RP{"Road provider"}
+    RP -- "offline" --> OC["Cell of 0.02°: seeded class,<br/>default limit for the class"]
+    RP -- "csv" --> BT["BallTree haversine:<br/>nearest road point"]
+    BT --> NM{"Within 50 m?"}
+    NM -- "yes" --> CL["road_class and speed_limit_kmh<br/>of the point"]
+    NM -- "no" --> UN["unknown, no limit"]
+    OC --> RD[/"road_class, speed_limit_kmh"/]
+    CL --> RD
+    UN --> RD
+    TAB[/"Collision CSV"/] --> HAS{"latitude and longitude<br/>columns?"}
+    HAS -- "no" --> REF[/"ValueError: a casualty table<br/>has no location"/]
+    HAS -- "yes" --> CNT["Count collisions for each 0.01° cell,<br/>bounding box of the table"]
+    CNT --> COV{"Share of readings inside<br/>the box ≥ 0.5?"}
+    COV -- "yes" --> DEN[/"collision_density for each reading"/]
+    COV -- "no" --> NOTE[/"Note in the context report:<br/>prior not used"/]
+```
 
 | Provider | Class | Input | Rule |
 |---|---|---|---|
@@ -303,6 +571,20 @@ flowchart TB
 
 **Purpose.** Make one row for each trip, and learn the harsh event rate.
 
+```mermaid
+flowchart TD
+    P[/"Readings with kinematics and context"/] --> G["Group by trip_id"]
+    G --> TWO{"2 rows or more?"}
+    TWO -- "no" --> SKIP["Skip the trip"]
+    TWO -- "yes" --> ROW["_trip_row: time, speed, weather,<br/>road shares, speeding, rpm, collision"]
+    ROW --> EX["distance_km = sum of dist_m / 1000"]
+    EX --> EV["trip_events: harsh_brake,<br/>harsh_accel, harsh_corner"]
+    EV --> MIN{"distance_km ≥ 0.5<br/>and duration_min ≥ 2?"}
+    MIN -- "no" --> DROP["Drop the trip"]
+    MIN -- "yes" --> CHK["assert_no_label_inputs(FEATURES)"]
+    CHK --> OUT[/"Trip table: trip_id, device, start,<br/>features, distance_km, harsh_events"/]
+```
+
 | Feature group | Columns |
 |---|---|
 | Time and size | `duration_min`, `start_hour`, `weekend`, `night_share` (22:00 to 05:59 UTC) |
@@ -319,6 +601,21 @@ flowchart TB
 | `glm` | Median imputation with missing flags, scaling, `PoissonRegressor(alpha=1.0)` |
 | `hgb` | `HistGradientBoostingRegressor(loss="poisson")`, learning rate 0.05, 300 iterations, 15 leaves, 20 trips for each leaf |
 
+```mermaid
+flowchart LR
+    IN[/"X, harsh_events, distance_km"/] --> CHK{"Exposure above 0<br/>and counts 0 or more?"}
+    CHK -- "no" --> ERR[/"ValueError"/]
+    CHK -- "yes" --> FR["fleet_rate_ = events / km"]
+    FR --> K{"kind"}
+    K -- "baseline" --> B["No model:<br/>rate = fleet_rate_"]
+    K -- "glm" --> G["Imputer with flags, StandardScaler,<br/>PoissonRegressor on events / km,<br/>weight = km"]
+    K -- "hgb" --> H["HistGradientBoostingRegressor<br/>Poisson loss on events / km,<br/>weight = km"]
+    B --> PR["predict_rate, clipped at 1e-9"]
+    G --> PR
+    H --> PR
+    PR --> PC[/"predict_count = rate × distance_km"/]
+```
+
 **Procedure (train)**
 
 1. Keep 25 % of the devices out with `GroupShuffleSplit`.
@@ -326,6 +623,27 @@ flowchart TB
 3. Keep the model with the lowest mean CV Poisson deviance.
 4. Fit it on all training devices with the distance as the weight.
 5. Score the held-out devices one time. Make the driver table and the permutation importance.
+
+```mermaid
+flowchart TD
+    T[/"Trip table"/] --> N{"4 devices or more?"}
+    N -- "no" --> ERR[/"ValueError"/]
+    N -- "yes" --> HO["holdout_split: GroupShuffleSplit,<br/>25 % of devices, seed"]
+    HO --> TR["Training devices"]
+    HO --> TE["Held-out devices"]
+    TR --> CV["grouped_cv for each model:<br/>GroupKFold, up to 5 folds"]
+    CV --> CH["Choose the lowest mean deviance,<br/>a tie goes to the first name"]
+    CH --> FIT["Fit the chosen model<br/>on all training devices"]
+    FIT --> SC["rate_metrics on the held-out devices"]
+    TE --> SC
+    SC --> DT["driver_table and driver Spearman"]
+    SC --> PI["permutation_importance:<br/>5 repeats on held-out trips"]
+    SC --> CAL["calibration_by_decile"]
+    DT --> SUM["Summary and bundle"]
+    PI --> SUM
+    CAL --> SUM
+    SUM --> RUN[("Run folder:<br/>model.joblib, metrics.json, model_card.md")]
+```
 
 **Rules**
 
@@ -342,7 +660,19 @@ flowchart TB
 | `harsh_brake` | `acc_long <= -3.0` m/s² |
 | `harsh_accel` | `acc_long >= 2.5` m/s² |
 | `harsh_corner` | `abs(acc_y) >= 3.0` m/s² |
-| One event | Flagged readings less than 3 s apart are one event |
+| One event | Flagged readings 3 s or less apart are one event |
+
+```mermaid
+flowchart LR
+    T[/"One trip: time, acc_long, acc_y"/] --> NAN["NaN becomes 0"]
+    NAN --> B["acc_long ≤ -3.0:<br/>brake flags"]
+    NAN --> A["acc_long ≥ 2.5:<br/>accel flags"]
+    NAN --> C["abs of acc_y ≥ 3.0:<br/>corner flags"]
+    B --> RUN["count_runs: sort the flagged times,<br/>a gap over 3 s starts a new event"]
+    A --> RUN
+    C --> RUN
+    RUN --> OUT[/"harsh_brake, harsh_accel, harsh_corner,<br/>harsh_events = sum"/]
+```
 
 | Trip rule (`TripRules`) | Value |
 |---|---|
@@ -365,6 +695,21 @@ flowchart TB
 |---|---|
 | Model choice | Lowest mean grouped-CV Poisson deviance. A tie goes to the first name in alphabetical order |
 | Risk index | 100 × driver predicted rate / fleet predicted rate. 100 is the fleet mean |
+
+```mermaid
+flowchart TD
+    IN[/"Trips: harsh_events, distance_km,<br/>predicted rate"/] --> EXP["expected = rate × distance_km"]
+    REF[/"Fleet rate of the training trips"/] --> RD["Reference deviance:<br/>fleet rate × distance_km"]
+    EXP --> PD["poisson_deviance"]
+    PD --> D2["D² = 1 − model deviance / reference deviance"]
+    RD --> D2
+    EXP --> GI["normalised_gini: Lorenz curve of km<br/>and events, sorted by predicted rate"]
+    EXP --> EO["expected / observed"]
+    EXP --> CAL["calibration_by_decile: 10 bins"]
+    EXP --> DRV["driver_table: km, trips, events<br/>for each device"]
+    DRV --> PER["predicted_per_100km,<br/>observed_per_100km"]
+    PER --> RI[/"risk_index = 100 × driver rate / fleet rate,<br/>sorted high to low"/]
+```
 
 ---
 
@@ -405,6 +750,22 @@ pip install -e ".[dev]"
 ```
 
 ### 10.3 Run driverisk
+
+```mermaid
+flowchart LR
+    SIMC["driverisk simulate"] --> LCSV[/"data/synthetic_telematics.csv"/]
+    LCSV --> VAL["driverisk validate"]
+    VAL --> REP[/"Ingest report"/]
+    LCSV --> TRC["driverisk trips"]
+    TRC --> TT[/"data/trips.csv"/]
+    LCSV --> TRN["driverisk train"]
+    TT -- "--trip-table" --> TRN
+    TRN --> RUN[("runs/latest or --out")]
+    RUN --> SCO["driverisk score --run"]
+    RUN --> EXPL["driverisk explain --run"]
+    SCO --> DRV[/"Driver table with risk_index"/]
+    EXPL --> IMP[/"Permutation importance JSON"/]
+```
 
 Offline (simulated fleet, no network):
 
